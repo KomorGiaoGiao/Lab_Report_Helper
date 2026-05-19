@@ -79,8 +79,7 @@ class ConfigScreen(Screen):
             return
         save_key_to_env(key)
         os.environ["DEEPSEEK_API_KEY"] = key
-        self.notify("配置已保存，正在启动...", timeout=3)
-        self.app.push_screen("chat")
+        self.dismiss(True)
 
 
 # ──────────────────────────────────────────────
@@ -110,6 +109,8 @@ class StreamHandler(BaseCallbackHandler):
 class ChatScreen(Screen):
     agent = None
     messages = []
+    _stream_widget = None
+    _stream_seq = 0
 
     def compose(self):
         yield Header(show_clock=False)
@@ -128,63 +129,82 @@ class ChatScreen(Screen):
         if text.lower() in ("quit", "exit"):
             self.app.exit()
             return
+        if text.lower() == "/config":
+            self.app.push_screen("config", self._on_config_done)
+            return
+        if text.lower() in ("/help", "/h"):
+            chat = self.query_one("#chat", VerticalScroll)
+            chat.mount(Static(Text("/config  更换 API Key\n/clear  清屏\nquit     退出", style="dim")))
+            chat.scroll_end(animate=False)
+            return
+        if text.lower() in ("/clear", "/cls"):
+            chat = self.query_one("#chat", VerticalScroll)
+            chat.remove_children()
+            return
         self._show_user(text)
         self._ask(text)
+
+    def _on_config_done(self, changed):
+        if changed:
+            self.agent = build_agent(streaming=True)
 
     def _show_user(self, text):
         chat = self.query_one("#chat", VerticalScroll)
         chat.mount(Static(Text(f"\n> {text}", style="bold green")))
         chat.scroll_end(animate=False)
 
-    def _show_tool(self, name, output=""):
+    def _show_tool(self, name, output="", seq=None):
+        if seq is not None and seq != self._stream_seq:
+            return
         chat = self.query_one("#chat", VerticalScroll)
         chat.mount(Static(Text(f"  > {name}", style="bold yellow")))
         if output:
             chat.mount(Static(Text(f"  -> {output}", style="dim")))
         chat.scroll_end(animate=False)
 
-    def _stream_response(self, text):
-        widget = self.query_one("#stream_response", Static)
-        widget.update(Markdown(text, code_theme=CODE_THEME))
+    def _stream_response(self, text, seq=None):
+        if seq is not None and seq != self._stream_seq:
+            return
+        if self._stream_widget is not None:
+            self._stream_widget.update(Markdown(text, code_theme=CODE_THEME))
+        self.query_one("#chat", VerticalScroll).scroll_end(animate=False)
 
     def _ask(self, text):
+        self._stream_seq += 1
+        seq = self._stream_seq
         self.messages.append({"role": "user", "content": text})
+        msgs = list(self.messages)
         chat = self.query_one("#chat", VerticalScroll)
         md = Markdown("", code_theme=CODE_THEME)
-        chat.mount(Static(md, id="stream_response"))
+        self._stream_widget = Static(md)
+        chat.mount(self._stream_widget)
         chat.scroll_end(animate=False)
 
         def on_token(t):
-            self.call_from_thread(self._stream_response, t)
+            self.app.call_from_thread(self._stream_response, t, seq)
 
         def on_tool(name, output=""):
-            self.call_from_thread(self._show_tool, name, output)
+            self.app.call_from_thread(self._show_tool, name, output, seq)
 
-        def on_done():
-            self.call_from_thread(self._finish_stream)
-
-        handler = StreamHandler(on_token, on_tool, on_done)
+        handler = StreamHandler(on_token, on_tool, lambda: None)
 
         def task():
             try:
                 result = self.agent.invoke(
-                    {"messages": self.messages},
+                    {"messages": msgs},
                     config={"callbacks": [handler]},
                 )
                 self.messages.append(result["messages"][-1])
             except Exception as e:
-                self.call_from_thread(lambda: self._stream_response(f"\n**错误:** {e}"))
+                self.app.call_from_thread(lambda: self._stream_response(f"\n**错误:** {e}", seq))
             finally:
-                self.call_from_thread(self._finish_stream)
+                self.app.call_from_thread(lambda: self._finish_stream(seq))
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _finish_stream(self):
-        try:
-            w = self.query_one("#stream_response", Static)
-            w.id = None
-        except Exception:
-            pass
+    def _finish_stream(self, seq):
+        if seq == self._stream_seq:
+            self._stream_widget = None
 
 
 # ──────────────────────────────────────────────
@@ -233,7 +253,11 @@ class LabReportApp(App):
         if is_configured():
             self.push_screen("chat")
         else:
-            self.push_screen("config")
+            self.push_screen("config", self._on_config_done)
+
+    def _on_config_done(self, configured):
+        if configured:
+            self.push_screen("chat")
 
 
 def main():
